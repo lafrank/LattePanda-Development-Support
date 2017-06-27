@@ -83,6 +83,7 @@ namespace LattePanda.Firmata
 
 
     private SerialPort _serialPort;
+    private bool isDisposed = false; // To detect redundant calls 
     private int _delay;
 
     public volatile int[] _digitalOutputData = new int[MAX_DATA_BYTES];
@@ -411,37 +412,21 @@ namespace LattePanda.Firmata
     }
 
     #region IDisposable Support
-    private bool disposedValue = false; // To detect redundant calls 
-
+   
     protected virtual void Dispose(bool disposing)
     {
-      if (!disposedValue)
+      if (!isDisposed)
       {
-        if (disposing)
-        {
-          // TODO: dispose managed state (managed objects).
-        }
-        // TODO: free unmanaged resources (unmanaged objects) and override a finalizer below.
-        // TODO: set large fields to null.
         _serialPort?.Close();
-        _serialPort.Dispose();
-
-        disposedValue = true;
+        _serialPort?.Dispose();
+        isDisposed = true;
       }
     }
-
-    // TODO: override a finalizer only if Dispose(bool disposing) above has code to free unmanaged resources.
-    // ~Arduino() {
-    //   // Do not change this code. Put cleanup code in Dispose(bool disposing) above.
-    //   Dispose(false);
-    // }
 
     // This code added to correctly implement the disposable pattern.
     public void Dispose()
     {
-      // Do not change this code. Put cleanup code in Dispose(bool disposing) above.
       Dispose(true);
-      // TODO: uncomment the following line if the finalizer is overridden above.
       GC.SuppressFinalize(this);
     }
     #endregion
