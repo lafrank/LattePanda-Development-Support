@@ -19,6 +19,15 @@
 * Special thanks to Tim Farley, on whose Firmata.NET library
   this code is based.
 *************************************************************/
+/*  
+ -----------------------------------------------------------
+ 
+ Modifications by Laszlo Frank, 2017.06.27, v0.1 
+ laszlo.frank@gmail.com
+
+ -----------------------------------------------------------
+ */
+ 
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -28,12 +37,13 @@ using System.Diagnostics;
 using System.Threading;
 
 namespace LattePanda.Firmata
-{
-  public delegate void DidI2CDataReveive(byte address, byte register, byte[] data);
+{                                    
+  public delegate void I2CDataReceived(byte address, byte register, byte[] data);
   public delegate void DigitalPinUpdated(byte pin, byte state);
   public delegate void AnalogPinUpdated(int pin, int value);
+  public delegate void FirmataMessageReceived(string Message);
 
-  class Arduino
+  class Arduino : IDisposable
   {
     public const byte LOW = 0;
     public const byte HIGH = 1;
@@ -48,9 +58,10 @@ namespace LattePanda.Firmata
     public const byte I2C_MODE_READ_CONTINUOUSLY = 0x10;
     public const byte I2C_MODE_STOP_READING = 0x18;
 
-    public event DidI2CDataReveive didI2CDataReveive;
-    public event DigitalPinUpdated digitalPinUpdated;
-    public event AnalogPinUpdated analogPinUpdated;
+    public event I2CDataReceived I2CDataReceived;
+    public event DigitalPinUpdated DigitalPinUpdated;
+    public event AnalogPinUpdated AnalogPinUpdated;
+    public event FirmataMessageReceived FirmataMessageReceived;
 
     public const int MAX_DATA_BYTES = 64;
     public const int DIGITAL_MESSAGE = 0x90; // send data for a digital port
@@ -62,12 +73,15 @@ namespace LattePanda.Firmata
 
     private const int TOTAL_PORTS = 2;
     private const int SERVO_CONFIG = 0x70; // set max angle, minPulse, maxPulse, freq
+    internal const int STRING_DATA = 0x71; // a string message with 14-bits per char
     private const int REPORT_ANALOG = 0xC0; // enable analog input by pin #
     private const int REPORT_DIGITAL = 0xD0; // enable digital input by port
     private const int SET_PIN_MODE = 0xF4; // set a pin to INPUT/OUTPUT/PWM/etc
     private const int SYSTEM_RESET = 0xFF; // reset from MIDI
     private const int I2C_REQUEST = 0x76; // I2C request messages from a host to an I/O board
     private const int I2C_CONFIG = 0x78; // Configure special I2C settings such as power pins and delay times
+
+
     private SerialPort _serialPort;
     private int _delay;
 
@@ -95,7 +109,8 @@ namespace LattePanda.Firmata
       _serialPort.DataBits = 8;
       _serialPort.Parity = Parity.None;
       _serialPort.StopBits = StopBits.One;
-
+      //_serialPort.ReadTimeout = 5000;
+      //_serialPort.WriteTimeout = 5000;
       if (autoStart)
       {
         this._delay = delay;
@@ -126,40 +141,53 @@ namespace LattePanda.Firmata
     /// default baud rate (57600), and a reboot delay (8 seconds).
     /// and automatically opens the specified serial connection.
     /// </summary>
+    /// 
     public Arduino() : this(Arduino.list().ElementAt(list().Length - 1), 57600, true, 8000) { }
+
     /// <summary>
     /// Opens the serial port connection, should it be required. By default the port is
     /// opened when the object is first created.
     /// </summary>
-    public void Open(bool isListen)
+    public bool Open(bool isListen)
     {
-      _serialPort.DtrEnable = true;
-      _serialPort.Open();
-
-      Thread.Sleep(_delay);
-
-      byte[] command = new byte[2];
-
-      for (int i = 0; i < 6; i++)
+      bool isOpened = false;
+      try
       {
-        command[0] = (byte)(REPORT_ANALOG | i);
-        command[1] = (byte)1;
-        _serialPort.Write(command, 0, 2);
-      }
+        _serialPort.DtrEnable = true;
+        _serialPort.Open();
 
-      for (int i = 0; i < 2; i++)
-      {
-        command[0] = (byte)(REPORT_DIGITAL | i);
-        command[1] = (byte)1;
-        _serialPort.Write(command, 0, 2);
-      }
-      command = null;
+        Thread.Sleep(_delay);
 
-      if (isListen)
-      {
-        this.StartListen();
+        byte[] command = new byte[2];
+
+        for (int i = 0; i < 6; i++)
+        {
+          command[0] = (byte)(REPORT_ANALOG | i);
+          command[1] = (byte)1;
+          _serialPort.Write(command, 0, 2);
+        }
+
+        for (int i = 0; i < 2; i++)
+        {
+          command[0] = (byte)(REPORT_DIGITAL | i);
+          command[1] = (byte)1;
+          _serialPort.Write(command, 0, 2);
+        }
+        command = null;
+
+        if (isListen)
+        {
+          this.StartListen();
+        }
+        isOpened = true;
       }
+      catch (System.IO.IOException)
+      {
+
+      }
+      return isOpened;
     }
+
     /// <summary>
     /// Closes the serial port.
     /// </summary>
@@ -170,13 +198,15 @@ namespace LattePanda.Firmata
     }
 
     /// <summary>
-    /// Start separate thread to monitor Firmata data for events didI2CDataReveive, digitalPinUpdated and analogPinUpdated
+    /// Start separate thread to monitor Firmata data for events didI2CDataReceive, digitalPinUpdated and analogPinUpdated
     /// </summary>
     public void StartListen()
     {
       if (_readThread == null)
       {
         _readThread = new Thread(processInput);
+        _readThread.Name = "Arduino input processor";
+        _readThread.IsBackground = true;
         _readThread.Start();
       }
     }
@@ -195,20 +225,21 @@ namespace LattePanda.Firmata
       }
     }
 
-    internal void callDidI2CDataReveive(byte address, byte register, byte[] data)
+    internal void callDidI2CDataReceive(byte address, byte register, byte[] data)
     {
-      if (this.didI2CDataReveive != null)
-        this.didI2CDataReveive(address, register, data);
+      I2CDataReceived?.Invoke(address, register, data);
     }
     internal void callDigitalPinUpdated(byte pin, byte state)
     {
-      if (this.digitalPinUpdated != null)
-        this.digitalPinUpdated(pin, state);
+      DigitalPinUpdated?.Invoke(pin, state);
     }
     internal void callAnalogPinUpdated(int pin, int value)
     {
-      if (this.analogPinUpdated != null)
-        this.analogPinUpdated(pin, value);
+      AnalogPinUpdated?.Invoke(pin, value);
+    }
+    internal void callFirmataMessageHandler(string Message)
+    {
+      FirmataMessageReceived?.Invoke(Message);
     }
 
     /// <summary>     
@@ -219,6 +250,7 @@ namespace LattePanda.Firmata
     {
       return SerialPort.GetPortNames();
     }
+
     /// <summary>
     /// Sets the mode of the specified pin (INPUT or OUTPUT).
     /// </summary>
@@ -233,6 +265,7 @@ namespace LattePanda.Firmata
       _serialPort.Write(message, 0, 3);
       message = null;
     }
+
     /// <summary>
     /// Returns the last known state of the digital pin.
     /// </summary>
@@ -243,6 +276,7 @@ namespace LattePanda.Firmata
       return ((_digitalInputData[pin >> 3] >> (pin & 0x07)) & 0x01);
     }
 
+
     /// <summary>
     /// Returns the last known state of the analog pin.
     /// </summary>
@@ -252,6 +286,7 @@ namespace LattePanda.Firmata
     {
       return _analogInputData[pin];
     }
+
     /// <summary>
     /// Write to a digital pin that has been toggled to output mode with pinMode() method.
     /// </summary>
@@ -286,6 +321,7 @@ namespace LattePanda.Firmata
       message[2] = (byte)(value >> 7);
       _serialPort.Write(message, 0, 3);
     }
+
     /// <summary>
     /// controlling servo
     /// </summary>
@@ -299,6 +335,7 @@ namespace LattePanda.Firmata
       message[2] = (byte)(angle >> 7);
       _serialPort.Write(message, 0, 3);
     }
+
     /// <summary>
     /// Init I2C Bus.
     /// </summary>
@@ -313,6 +350,7 @@ namespace LattePanda.Firmata
       message[4] = (byte)(END_SYSEX);//END_SYSEX
       _serialPort.Write(message, 0, 5);
     }
+
     /// <summary>
     /// Write to a digital pin that has been toggled to output mode with pinMode() method.
     /// </summary>
@@ -323,7 +361,7 @@ namespace LattePanda.Firmata
     public void wireRequest(byte slaveAddress, Int16 slaveRegister, Int16[] data, byte mode)
     {
       byte[] message = new byte[MAX_DATA_BYTES];
-      message[0] = (byte)(0xF0);
+      message[0] = (byte)(START_SYSEX);
       message[1] = (byte)(I2C_REQUEST);
       message[2] = (byte)(slaveAddress);
       message[3] = (byte)(mode);
@@ -335,7 +373,7 @@ namespace LattePanda.Firmata
         message[index] = (byte)(slaveRegister >> 7);
         index += 1;
       }
-      for (int i = 0; i < (data.Count()); i++)
+      for (int i = 0; i < (data?.Count() ?? 0); i++)
       {
         message[index] = (byte)(data[i] & 0x7F);
         index += 1;
@@ -345,7 +383,8 @@ namespace LattePanda.Firmata
       message[index] = (byte)(END_SYSEX);
       _serialPort.Write(message, 0, index + 1);
     }
-    private int available()
+
+    public int available()
     {
       return _serialPort.BytesToRead;
     }
@@ -355,16 +394,57 @@ namespace LattePanda.Firmata
     /// </summary>
     public void processInput()
     {
-      var autoEvent = new AutoResetEvent(false);
+      AutoResetEvent areProcessingFinished = new AutoResetEvent(false);
       var inputProcessor = new InputProcessor(_serialPort, this);
       // Execute method by a timer every 30ms
-      var stateTimer = new Timer(inputProcessor.InputProcess, autoEvent, 0, 30);
+      var stateTimer = new Timer(inputProcessor.ProcessInput, areProcessingFinished, 0, 30);
 
       // Wait when method return anything
-      autoEvent.WaitOne();
+      areProcessingFinished.WaitOne();
       // This line will executes only when inputProcessor are done. For example serialPort is closed.
       stateTimer.Dispose();
     }
+
+    public bool IsOpen
+    {
+      get { return _serialPort?.IsOpen ?? false; }
+    }
+
+    #region IDisposable Support
+    private bool disposedValue = false; // To detect redundant calls 
+
+    protected virtual void Dispose(bool disposing)
+    {
+      if (!disposedValue)
+      {
+        if (disposing)
+        {
+          // TODO: dispose managed state (managed objects).
+        }
+        // TODO: free unmanaged resources (unmanaged objects) and override a finalizer below.
+        // TODO: set large fields to null.
+        _serialPort?.Close();
+        _serialPort.Dispose();
+
+        disposedValue = true;
+      }
+    }
+
+    // TODO: override a finalizer only if Dispose(bool disposing) above has code to free unmanaged resources.
+    // ~Arduino() {
+    //   // Do not change this code. Put cleanup code in Dispose(bool disposing) above.
+    //   Dispose(false);
+    // }
+
+    // This code added to correctly implement the disposable pattern.
+    public void Dispose()
+    {
+      // Do not change this code. Put cleanup code in Dispose(bool disposing) above.
+      Dispose(true);
+      // TODO: uncomment the following line if the finalizer is overridden above.
+      GC.SuppressFinalize(this);
+    }
+    #endregion
   } // End Arduino class
 
   class InputProcessor
@@ -388,114 +468,130 @@ namespace LattePanda.Firmata
       _arduino = arduino;
     }
 
-    public void InputProcess(Object stateInfo)
+    public void ProcessInput(Object stateInfo)
     {
       if (Monitor.TryEnter(_serialPort))
       {
         try
         {
-          AutoResetEvent autoEvent = (AutoResetEvent)stateInfo;
-
-          if (!_serialPort.IsOpen)
+          try
           {
-            // Signal the waiting thread we are done
-            autoEvent.Set();
-            return;
-          }
-
-          if (_serialPort.BytesToRead == 0)
-          {
-            return;
-          }
-
-          int inputData = _serialPort.ReadByte();
-          int command;
-
-          if (_parsingSysex)
-          {
-            if (inputData == Arduino.END_SYSEX)
+            AutoResetEvent areProcessingFinished = (AutoResetEvent)stateInfo;
+            if (!_serialPort.IsOpen)
             {
-              _parsingSysex = false;
-              if (_sysexBytesRead > 5 && _storedInputData[0] == Arduino.I2C_REPLY)
+              // Signal the waiting thread we are done
+              areProcessingFinished.Set();
+              return;
+            }
+            int bytesToRead = _serialPort.BytesToRead;
+            if (bytesToRead == 0) return;
+
+            byte[] serialData = new byte[bytesToRead];
+            _serialPort.Read(serialData, 0, bytesToRead);
+            foreach (byte inputData in serialData)
+            {
+              byte command;
+
+              if (_parsingSysex)
               {
-                byte[] i2cReceivedData = new byte[(_sysexBytesRead - 1) / 2];
-                for (int i = 0; i < i2cReceivedData.Count(); i++)
+                if (inputData == Arduino.END_SYSEX)
                 {
-                  i2cReceivedData[i] = (byte)(_storedInputData[(i * 2) + 1] | _storedInputData[(i * 2) + 2] << 7);
-                }
-                _arduino.callDidI2CDataReveive(i2cReceivedData[0], i2cReceivedData[1], i2cReceivedData.Skip(2).ToArray());
-
-              }
-              _sysexBytesRead = 0;
-            }
-            else
-            {
-              _storedInputData[_sysexBytesRead] = inputData;
-              _sysexBytesRead++;
-            }
-          }
-          else if (_waitForData > 0 && inputData < 128)
-          {
-            _waitForData--;
-            _storedInputData[_waitForData] = inputData;
-
-            if (_executeMultiByteCommand != 0 && _waitForData == 0)
-            {
-              //we got everything
-              switch (_executeMultiByteCommand)
-              {
-                case Arduino.DIGITAL_MESSAGE:
-                  int currentDigitalInput = (_storedInputData[0] << 7) + _storedInputData[1];
-                  for (int i = 0; i < 8; i++)
+                  _parsingSysex = false;
+                  if (_sysexBytesRead > 5 && _storedInputData[0] == Arduino.I2C_REPLY)
                   {
-                    if (((1 << i) & (currentDigitalInput & 0xff)) != ((1 << i) & (_arduino._digitalInputData[_multiByteChannel] & 0xff)))
+                    byte[] i2cReceivedData = new byte[(_sysexBytesRead - 1) / 2];
+                    for (int i = 0; i < i2cReceivedData.Count(); i++)
                     {
-                      if ((((1 << i) & (currentDigitalInput & 0xff))) != 0)
-                      {
-                        _arduino.callDigitalPinUpdated((byte)(i + _multiByteChannel * 8), Arduino.HIGH);
-                      }
-                      else
-                      {
-                        _arduino.callDigitalPinUpdated((byte)(i + _multiByteChannel * 8), Arduino.LOW);
-                      }
+                      i2cReceivedData[i] = (byte)(_storedInputData[(i * 2) + 1] | _storedInputData[(i * 2) + 2] << 7);
                     }
-                  }
-                  _arduino._digitalInputData[_multiByteChannel] = (_storedInputData[0] << 7) + _storedInputData[1];
+                    _arduino.callDidI2CDataReceive(i2cReceivedData[0], i2cReceivedData[1], i2cReceivedData.Skip(2).ToArray());
 
-                  break;
-                case Arduino.ANALOG_MESSAGE:
-                  _arduino._analogInputData[_multiByteChannel] = (_storedInputData[0] << 7) + _storedInputData[1];
-                  _arduino.callAnalogPinUpdated(_multiByteChannel, (_storedInputData[0] << 7) + _storedInputData[1]);
-                  break;
-                case Arduino.REPORT_VERSION:
-                  this._majorVersion = _storedInputData[1];
-                  this._minorVersion = _storedInputData[0];
-                  break;
+                  }
+                  else if (_sysexBytesRead > 5 && _storedInputData[0] == Arduino.STRING_DATA)
+                  {
+                    StringBuilder sb = new StringBuilder();
+                    for (int i = 0; i < (_sysexBytesRead - 1) / 2; i++) sb.Append((char)(_storedInputData[(i * 2) + 1] | _storedInputData[(i * 2) + 2] << 7));
+                    _arduino?.callFirmataMessageHandler(sb.ToString());
+                  }
+                  _sysexBytesRead = 0;
+                }
+                else
+                {
+                  _storedInputData[_sysexBytesRead] = inputData;
+                  _sysexBytesRead++;
+                }
+              }
+              else if (_waitForData > 0 && inputData < 128)
+              {
+                _waitForData--;
+                _storedInputData[_waitForData] = inputData;
+                if (_executeMultiByteCommand != 0 && _waitForData == 0)
+                {
+                  //we got everything
+                  switch (_executeMultiByteCommand)
+                  {
+                    case Arduino.DIGITAL_MESSAGE:
+                      int currentDigitalInput = (_storedInputData[0] << 7) + _storedInputData[1];
+                      for (int i = 0; i < 8; i++)
+                      {
+                        if (((1 << i) & (currentDigitalInput & 0xff)) != ((1 << i) & (_arduino._digitalInputData[_multiByteChannel] & 0xff)))
+                        {
+                          if ((((1 << i) & (currentDigitalInput & 0xff))) != 0)
+                          {
+                            _arduino.callDigitalPinUpdated((byte)(i + _multiByteChannel * 8), Arduino.HIGH);
+                          }
+                          else
+                          {
+                            _arduino.callDigitalPinUpdated((byte)(i + _multiByteChannel * 8), Arduino.LOW);
+                          }
+                        }
+                      }
+                      _arduino._digitalInputData[_multiByteChannel] = (_storedInputData[0] << 7) + _storedInputData[1];
+
+                      break;
+                    case Arduino.ANALOG_MESSAGE:
+                      _arduino._analogInputData[_multiByteChannel] = (_storedInputData[0] << 7) + _storedInputData[1];
+                      _arduino.callAnalogPinUpdated(_multiByteChannel, (_storedInputData[0] << 7) + _storedInputData[1]);
+                      break;
+                    case Arduino.REPORT_VERSION:
+                      this._majorVersion = _storedInputData[1];
+                      this._minorVersion = _storedInputData[0];
+                      break;
+                  }
+                }
+              }
+              else
+              {
+                if (inputData < 0xF0)
+                {
+                  command = (byte)(inputData & 0xF0);
+                  #region Debug print received message
+                  //FirmataMessages fmsg = FirmataMessages.UNKNOWN_MASSAGE;
+                  //if (Enum.IsDefined(typeof(FirmataMessages), (int)command)) fmsg = (FirmataMessages)(int)command;
+                  //Debug.WriteLine(string.Format("Command received : {0}", fmsg));
+                  #endregion
+                  _multiByteChannel = inputData & 0x0F;
+                  switch (command)
+                  {
+                    case Arduino.DIGITAL_MESSAGE:
+                    case Arduino.ANALOG_MESSAGE:
+                    case Arduino.REPORT_VERSION:
+                      _waitForData = 2;
+                      _executeMultiByteCommand = command;
+                      break;
+                  }
+                }
+                else if (inputData == Arduino.START_SYSEX)
+                {
+                  _parsingSysex = true;
+                  // commands in the 0xF* range don't use channel data
+                }
               }
             }
           }
-          else
+          catch (Exception Ex)
           {
-            if (inputData < 0xF0)
-            {
-              command = inputData & 0xF0;
-              _multiByteChannel = inputData & 0x0F;
-              switch (command)
-              {
-                case Arduino.DIGITAL_MESSAGE:
-                case Arduino.ANALOG_MESSAGE:
-                case Arduino.REPORT_VERSION:
-                  _waitForData = 2;
-                  _executeMultiByteCommand = command;
-                  break;
-              }
-            }
-            else if (inputData == 0xF0)
-            {
-              _parsingSysex = true;
-              // commands in the 0xF* range don't use channel data
-            }
-
+            Debug.WriteLine("Error in ProcessInput : " + Ex.Message);
           }
         }
         finally
@@ -506,4 +602,13 @@ namespace LattePanda.Firmata
     }
   }
 
+  /// <summary>
+  /// Currently used for debugging purposes only in ProcessInput()
+  /// </summary>
+  internal enum FirmataMessages
+  {
+    UNKNOWN_MASSAGE = 0, DIGITAL_MESSAGE = 0x90, ANALOG_MESSAGE = 0xE0, REPORT_VERSION = 0xF9, START_SYSEX = 0xF0, END_SYSEX = 0xF7,
+    I2C_REPLY = 0x77, SERVO_CONFIG = 0x70, REPORT_ANALOG = 0xC0, REPORT_DIGITAL = 0xD0, SET_PIN_MODE = 0xF4, SYSTEM_RESET = 0xFF, STRING_DATA = 0x71,
+    I2C_REQUEST = 0x76, I2C_CONFIG = 0x78
+  }
 } // End namespace
